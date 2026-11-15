@@ -313,6 +313,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     }
     private var zoomGestureDetectorIsInProgress = false
 
+    // Set while the camera access toggle keeps the camera disconnected
+    private var cameraBlockedBySensorPrivacy = false
+
     private val handler = object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
             super.handleMessage(msg)
@@ -1167,6 +1170,16 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         permissionsGatedCallback.runAfterPermissionsCheck()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+
+        // The camera access toggle can also be turned off from Quick Settings, which does not
+        // pause this activity: try the camera again once the window gets the focus back.
+        if (hasFocus && cameraBlockedBySensorPrivacy && canRestartCamera()) {
+            permissionsGatedCallback.runAfterPermissionsCheck()
+        }
+    }
+
     override fun onPause() {
         // Remove location and location updates
         locationListener.unregister()
@@ -1415,6 +1428,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
         // Unbind previous use cases
         cameraController.unbind()
+        cameraBlockedBySensorPrivacy = false
 
         cameraState = CameraState.IDLE
 
@@ -1575,9 +1589,12 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                     CameraXCameraState.ERROR_CAMERA_DISABLED -> {
                         showToast(R.string.error_camera_disabled)
                         // The camera access toggle can be turned off from the dialog the system
-                        // shows over this activity; onResume() binds the camera again. A
-                        // device policy needs another user action, so bail out.
-                        if (!isCameraBlockedBySensorPrivacy()) {
+                        // shows over this activity or from Quick Settings; onResume() or
+                        // onWindowFocusChanged() binds the camera again. A device policy needs
+                        // another user action, so bail out.
+                        if (isCameraBlockedBySensorPrivacy()) {
+                            cameraBlockedBySensorPrivacy = true
+                        } else {
                             finish()
                         }
                     }
