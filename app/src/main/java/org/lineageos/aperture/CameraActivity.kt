@@ -7,6 +7,7 @@ package org.lineageos.aperture
 
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
+import android.app.admin.DevicePolicyManager
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -15,6 +16,7 @@ import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.AnimatedVectorDrawable
 import android.graphics.drawable.ColorDrawable
+import android.hardware.SensorPrivacyManager
 import android.icu.text.DecimalFormat
 import android.net.Uri
 import android.os.Build
@@ -186,6 +188,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private val zoomLevel by lazy { findViewById<HorizontalSlider>(R.id.zoomLevel) }
 
     // System services
+    private val devicePolicyManager by lazy { getSystemService(DevicePolicyManager::class.java) }
     private val keyguardManager by lazy { getSystemService(KeyguardManager::class.java) }
 
     /**
@@ -252,6 +255,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
     }
     private var zoomGestureDetectorIsInProgress = false
+
+    // Set while the camera access toggle keeps the camera disconnected
+    private var cameraBlockedBySensorPrivacy = false
 
     private val handler = object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
@@ -782,6 +788,10 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                         it.cause
                     )
 
+                    if (it.code == CameraXCameraState.ERROR_CAMERA_DISABLED) {
+                        cameraBlockedBySensorPrivacy = isCameraBlockedBySensorPrivacy()
+                    }
+
                     if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                         return@collect
                     }
@@ -819,9 +829,14 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                         }
 
                         CameraXCameraState.ERROR_CAMERA_DISABLED -> {
-                            // No way to fix it without user action, bail out
                             showToast(R.string.error_camera_disabled)
-                            finish()
+                            // The camera access toggle can be turned off from the dialog the
+                            // system shows over this activity or from Quick Settings;
+                            // onWindowFocusChanged() binds the camera again. A device policy
+                            // needs another user action, so bail out.
+                            if (!cameraBlockedBySensorPrivacy) {
+                                finish()
+                            }
                         }
 
                         CameraXCameraState.ERROR_CAMERA_FATAL_ERROR -> {
@@ -1468,6 +1483,31 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+
+        // Turning the camera access toggle off neither stops this activity nor changes the camera
+        // configuration: try the camera again once the window gets the focus back.
+        if (hasFocus && cameraBlockedBySensorPrivacy &&
+            viewModel.cameraState.value == CameraState.IDLE && !countDownView.isVisible
+        ) {
+            viewModel.cameraConfiguration.replayCache.lastOrNull()?.let {
+                bindCameraUseCases(it)
+            }
+        }
+    }
+
+    /**
+     * Without a device policy disabling the camera, ERROR_CAMERA_DISABLED comes from the camera
+     * access toggle: on camera HALs without camera mute, the camera service disconnects the client
+     * instead of sending black frames.
+     */
+    private fun isCameraBlockedBySensorPrivacy() =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                getSystemService(SensorPrivacyManager::class.java)
+                    ?.supportsSensorToggle(SensorPrivacyManager.Sensors.CAMERA) == true &&
+                devicePolicyManager?.getCameraDisabled(null) == false
+
     /**
      * Rebind cameraProvider use cases
      */
@@ -1482,6 +1522,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
         // Unbind previous use cases
         viewModel.cameraController.unbind()
+        cameraBlockedBySensorPrivacy = false
 
         // Hide grid until preview is ready
         gridView.alpha = 0f
