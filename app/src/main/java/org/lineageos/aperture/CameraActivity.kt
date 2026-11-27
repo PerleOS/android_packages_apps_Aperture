@@ -6,6 +6,7 @@
 package org.lineageos.aperture
 
 import android.animation.ValueAnimator
+import android.app.AppOpsManager
 import android.app.KeyguardManager
 import android.app.admin.DevicePolicyManager
 import android.content.ClipData
@@ -24,6 +25,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.os.Process
 import android.provider.MediaStore
 import android.util.Log
 import android.view.GestureDetector
@@ -188,6 +190,10 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private val zoomLevel by lazy { findViewById<HorizontalSlider>(R.id.zoomLevel) }
 
     // System services
+    private val appOpsManager by lazy { getSystemService(AppOpsManager::class.java) }
+    private val cameraOpListener = AppOpsManager.OnOpChangedListener { _, _ ->
+        runOnUiThread { retryCameraIfUnblocked() }
+    }
     private val devicePolicyManager by lazy { getSystemService(DevicePolicyManager::class.java) }
     private val keyguardManager by lazy { getSystemService(KeyguardManager::class.java) }
 
@@ -636,6 +642,18 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         lifecycleScope.launch {
             queueSetupWithCameraPermissions()
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+
+        appOpsManager?.startWatchingMode(AppOpsManager.OPSTR_CAMERA, packageName, cameraOpListener)
+    }
+
+    override fun onStop() {
+        appOpsManager?.stopWatchingMode(cameraOpListener)
+
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -1486,9 +1504,21 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
 
-        // Turning the camera access toggle off neither stops this activity nor changes the camera
-        // configuration: try the camera again once the window gets the focus back.
-        if (hasFocus && cameraBlockedBySensorPrivacy &&
+        if (hasFocus) {
+            retryCameraIfUnblocked()
+        }
+    }
+
+    /**
+     * Turning the camera access toggle off neither stops this activity nor changes the camera
+     * configuration: try the camera again once the window has the focus back and the toggle is
+     * off. The system lifts the camera op restriction asynchronously, after its dialog may
+     * already be gone, so this runs both on focus gain and on op changes. Each attempt while the
+     * toggle is on brings back the system dialog, so retrying after "Cancel" would show it again
+     * and again.
+     */
+    private fun retryCameraIfUnblocked() {
+        if (hasWindowFocus() && cameraBlockedBySensorPrivacy && !isCameraOpRestricted() &&
             viewModel.cameraState.value == CameraState.IDLE && !countDownView.isVisible
         ) {
             viewModel.cameraConfiguration.replayCache.lastOrNull()?.let {
@@ -1496,6 +1526,15 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             }
         }
     }
+
+    /**
+     * The camera access toggle restricts the camera app op for every app, so the app's own camera
+     * op reads MODE_IGNORED while the toggle is on. The toggle state itself is a system API.
+     */
+    private fun isCameraOpRestricted() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            appOpsManager?.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_CAMERA, Process.myUid(), packageName
+            ) == AppOpsManager.MODE_IGNORED
 
     /**
      * Without a device policy disabling the camera, ERROR_CAMERA_DISABLED comes from the camera
